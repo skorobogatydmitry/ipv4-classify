@@ -1,5 +1,6 @@
 use std::{
     cmp,
+    collections::HashMap,
     fmt::{Debug, Display, Formatter},
     fs,
     mem::replace,
@@ -14,6 +15,8 @@ pub fn parse_file_to_tree(file_name: String) {
     let mut addrs: Vec<Ipv4Addr> = fs::read_to_string(&file_name)
         .expect(&format!("can't read {}", file_name))
         .split("\n")
+        .map(|el| el.trim())
+        .filter(|el| !el.is_empty())
         .map(|str_addr| {
             Ipv4Addr::from_str(str_addr)
                 .expect(&format!("cannot parse {} as IPv4 address", str_addr))
@@ -48,7 +51,11 @@ pub fn parse_file_to_tree(file_name: String) {
                 }
             }
         }
-        println!("the tree is {}", address_tree);
+        println!("all subnets are:");
+        for (subnet, ips) in address_tree.get_subnets_map() {
+            println!("{} subnet", subnet);
+            println!("\t{}", ips.join("\n\t"));
+        }
     } else {
         panic!("addresses list is empty");
     }
@@ -130,6 +137,7 @@ impl Display for Prefix {
     }
 }
 
+#[derive(Debug)]
 struct AddressTree {
     prefix: Prefix,
     children: Option<Vec<AddressTree>>,
@@ -201,16 +209,64 @@ impl AddressTree {
 
         self.children = Some(vec![new_me, neighbour]);
     }
+
+    // return vector of "subnets" - prefixes that contain at least one tree leaf
+    fn get_subnets(&self) -> Vec<&AddressTree> {
+        let mut res = vec![];
+        if let Some(ref children) = self.children {
+            for ch in children {
+                if ch.prefix.mask_len == 32 && ch.children.is_none() {
+                    res.push(self);
+                    break; // chop the subtree at the first IP address in it
+                }
+                res.append(&mut ch.get_subnets());
+            }
+        }
+        res
+    }
+
+    fn get_leafs(&self) -> Vec<&AddressTree> {
+        let mut res = vec![];
+        if let Some(ref children) = self.children {
+            for ch in children {
+                if ch.children.is_none() {
+                    res.push(ch);
+                } else {
+                    res.append(&mut ch.get_leafs());
+                }
+            }
+        }
+        res
+    }
+
+    /// make a human-readable map of subnets to all their addresses
+    fn get_subnets_map(&self) -> HashMap<String, Vec<String>> {
+        let subnets = self.get_subnets();
+        let mut res = HashMap::new();
+
+        for s in subnets {
+            res.insert(
+                s.prefix.to_string(),
+                s.get_leafs()
+                    .iter()
+                    .map(|leaf| leaf.prefix.to_string())
+                    .collect(),
+            );
+        }
+        res
+    }
 }
 
 impl Display for AddressTree {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
-        f.write_str(&format!("{} => [", self.prefix))?;
+        f.write_str(&format!("{}", self.prefix))?;
         if let Some(ref children) = self.children {
+            f.write_str("=>[")?;
             for ref ch in children {
-                ch.fmt(f)?;
+                <AddressTree as Display>::fmt(&ch, f)?;
             }
+            f.write_str("]")?;
         }
-        f.write_str("];")
+        f.write_str(";")
     }
 }
