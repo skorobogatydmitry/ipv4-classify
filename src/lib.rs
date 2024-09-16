@@ -156,10 +156,12 @@ impl AddressTree {
     /// Ok(()) - if address was adopted by the tree
     /// Err(new_addr) - if it doesn't belond to the subtree
     pub fn push(&mut self, new_addr: Ipv4Addr) -> Result<(), Ipv4Addr> {
+        eprintln!("attempt to push {} to {}", new_addr, self.prefix);
         if self.prefix.contains(&new_addr) {
             if let Some(ref mut children) = self.children {
                 let mut is_consumed = false;
                 for ch in children.iter_mut() {
+                    eprintln!("processing prefix {}", ch.prefix);
                     is_consumed = match ch.push(new_addr) {
                         Ok(_) => true, // address found its place, nothing to do here
                         Err(new_addr) => {
@@ -170,15 +172,23 @@ impl AddressTree {
                                 Some(self.prefix.mask_len + 1),
                             ) {
                                 Some(new_prefix) => {
+                                    eprintln!(
+                                        "address {} and {} are joined into {}",
+                                        new_addr, ch.prefix, new_prefix
+                                    );
                                     ch.stepdown(new_prefix, AddressTree::new(&new_addr));
-                                    true // found there's something in common
+                                    true // found something in common
                                 }
                                 None => false, // the addr doesn't have anything in common with the child
                             }
                         }
                     };
+                    if is_consumed {
+                        break;
+                    }
                 }
                 if !is_consumed {
+                    eprintln!("address {} settled in {}", new_addr, self.prefix);
                     children.push(AddressTree::new(&new_addr));
                 }
                 return Ok(());
@@ -214,12 +224,13 @@ impl AddressTree {
     fn get_subnets(&self) -> Vec<&AddressTree> {
         let mut res = vec![];
         if let Some(ref children) = self.children {
-            for ch in children {
-                if ch.prefix.mask_len == 32 && ch.children.is_none() {
-                    res.push(self);
-                    break; // chop the subtree at the first IP address in it
+            if children.iter().any(|ch| ch.prefix.mask_len == 32) {
+                // chop the subtree at the first IP address in it
+                res.push(self);
+            } else {
+                for ch in children {
+                    res.append(&mut ch.get_subnets());
                 }
-                res.append(&mut ch.get_subnets());
             }
         }
         res
