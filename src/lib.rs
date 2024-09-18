@@ -1,64 +1,94 @@
 use std::{
     cmp,
     collections::HashMap,
+    env::home_dir,
+    error::Error,
     fmt::{Debug, Display, Formatter},
     fs,
     mem::replace,
-    net::Ipv4Addr,
+    net::{AddrParseError, Ipv4Addr},
+    path::Path,
     str::FromStr,
 };
 
 #[cfg(test)]
 mod test;
 
-pub fn parse_file_to_tree(file_name: String) {
-    let mut addrs: Vec<Ipv4Addr> = fs::read_to_string(&file_name)
-        .expect(&format!("can't read {}", file_name))
-        .split("\n")
-        .map(|el| el.trim())
-        .filter(|el| !el.is_empty())
-        .map(|str_addr| {
-            Ipv4Addr::from_str(str_addr)
-                .expect(&format!("cannot parse {} as IPv4 address", str_addr))
+pub const IPINFO_TOKEN_FILE: &str = ".ipinfo/token";
+
+/// tool's options
+pub struct Config {
+    pub file_names: Vec<String>,
+    ipinfo_token: Option<String>,
+}
+
+impl Config {
+    pub fn new(file_names: Vec<String>, query_ipinfo: bool) -> Result<Config, Box<dyn Error>> {
+        let ipinfo_token = if query_ipinfo {
+            let full_path = home_dir()
+                .ok_or("Unable to get user home directory")?
+                .join(IPINFO_TOKEN_FILE);
+            eprintln!(
+                "reading ipinfo.io token from {}",
+                full_path.to_str().unwrap()
+            );
+            Some(fs::read_to_string(full_path)?)
+        } else {
+            None
+        };
+        for f in &file_names {
+            if !Path::new(f).exists() {
+                return Err(format!("file {} doesn't exist", f).into());
+            }
+        }
+
+        Ok(Config {
+            file_names,
+            ipinfo_token,
         })
-        .collect();
-    eprintln!("there are {} addresses", addrs.len());
-    if let Some(seed) = addrs.pop() {
-        let mut address_tree = AddressTree::new(&seed);
-        for addr in addrs {
+    }
+}
+
+pub fn find_subnets(
+    file_names: Vec<String>,
+) -> Result<HashMap<String, Vec<String>>, Box<dyn Error>> {
+    let mut address_tree = AddressTree::new();
+
+    for file_name in file_names {
+        eprintln!("loading file {}", file_name);
+        let mut addrs = fs::read_to_string(&file_name)?
+            .split("\n")
+            .map(|el| el.trim())
+            .filter(|el| !el.is_empty())
+            .map(|str_addr| Ipv4Addr::from_str(str_addr))
+            .collect::<Result<Vec<Ipv4Addr>, AddrParseError>>()?;
+
+        eprintln!("there are {} addresses in {}", addrs.len(), file_name);
+        while let Some(addr) = addrs.pop() {
             match address_tree.push(addr) {
-                Ok(_) => eprintln!("address {} fits the prefix {}", addr, address_tree.prefix),
+                Ok(_) => (),
                 Err(addr) => {
-                    let curr_prefix = &address_tree.prefix;
-                    let addr_prefix = Prefix::from_addr(&addr);
-                    if curr_prefix.bean == addr_prefix.bean & curr_prefix.mask {
-                        panic!(
-                            "address {} belongs to the current prefix {}, but wasn't consumed!",
-                            addr, curr_prefix
-                        )
-                    } else {
-                        // in all other case we need to build a new tree
-                        match Prefix::common_of(curr_prefix, &addr_prefix, None) {
-                            Some(new_prefix) => {
-                                address_tree.stepdown(new_prefix, AddressTree::new(&addr))
-                            }
-                            None => panic!(
-                                "no common prefix found for prefixes {} and {}!",
-                                curr_prefix, addr_prefix
-                            ),
-                        }
-                    }
+                    return Err(
+                        format!("address {} doesn't belong to IPv4 address space", addr).into(),
+                    )
                 }
             }
         }
-        println!("all subnets are:");
-        for (subnet, ips) in address_tree.get_subnets_map() {
-            println!("{} subnet", subnet);
-            println!("\t{}", ips.join("\n\t"));
-        }
-    } else {
-        panic!("addresses list is empty");
     }
+    println!("subnets found:");
+    let subnets = address_tree.get_subnets_map();
+    for (subnet, ips) in &subnets {
+        println!("{} subnet", subnet);
+        println!("\t{}", ips.join("\n\t"));
+    }
+    Ok(subnets)
+}
+
+fn recheck_subnets(_subnets: HashMap<Prefix, Vec<Ipv4Addr>>) {
+    // for each IP in the subnet
+    // - check its actual subnet using API
+    // - ...
+    todo!()
 }
 
 #[derive(Debug, PartialEq)]
@@ -69,6 +99,15 @@ struct Prefix {
 }
 
 impl Prefix {
+    /// root of all ipv4 addresses
+    pub fn root() -> Self {
+        Prefix {
+            bean: 0,
+            mask_len: 0,
+            mask: 0,
+        }
+    }
+
     /// checks whether the prefix includes the address
     pub fn contains(&self, addr: &Ipv4Addr) -> bool {
         let addr_number = u32::from_be_bytes(addr.octets());
@@ -144,9 +183,18 @@ struct AddressTree {
 }
 
 impl AddressTree {
-    pub fn new(seed: &Ipv4Addr) -> Self {
+    /// make a new empty tree starting from 0.0.0.0/0
+    pub fn new() -> Self {
         AddressTree {
-            prefix: Prefix::from_addr(seed),
+            prefix: Prefix::root(),
+            children: None,
+        }
+    }
+
+    // make a new empty tree starting at addr
+    fn of(addr: &Ipv4Addr) -> Self {
+        AddressTree {
+            prefix: Prefix::from_addr(addr),
             children: None,
         }
     }
@@ -176,7 +224,7 @@ impl AddressTree {
                                         "address {} and {} are joined into {}",
                                         new_addr, ch.prefix, new_prefix
                                     );
-                                    ch.stepdown(new_prefix, AddressTree::new(&new_addr));
+                                    ch.stepdown(new_prefix, AddressTree::of(&new_addr));
                                     true // found something in common
                                 }
                                 None => false, // the addr doesn't have anything in common with the child
@@ -189,7 +237,7 @@ impl AddressTree {
                 }
                 if !is_consumed {
                     eprintln!("address {} settled in {}", new_addr, self.prefix);
-                    children.push(AddressTree::new(&new_addr));
+                    children.push(AddressTree::of(&new_addr));
                 }
                 return Ok(());
             } else {
