@@ -1,7 +1,6 @@
 use std::{
     cmp,
     collections::HashMap,
-    env::home_dir,
     error::Error,
     fmt::{Debug, Display, Formatter},
     fs,
@@ -13,51 +12,20 @@ use std::{
 #[cfg(test)]
 mod test;
 
-/// relative path to auth token in the current user's home dir
-pub const IPINFO_TOKEN_FILE: &str = ".ipinfo/token";
-
 /// parsed tool's config
 pub struct Config {
     pub file_names: Vec<String>,
-    ipinfo_token: Option<String>,
-    ipinfo_use_cache: bool,
 }
 
 impl Config {
-    pub fn new(file_names: Vec<String>, query_ipinfo: bool) -> Result<Config, Box<dyn Error>> {
-        let ipinfo_token = if query_ipinfo {
-            let full_path = home_dir()
-                .ok_or("unable to get user home directory")?
-                .join(IPINFO_TOKEN_FILE);
-            eprintln!(
-                "reading ipinfo.io token from {}",
-                full_path.to_str().unwrap()
-            );
-            Some(fs::read_to_string(full_path)?)
-        } else {
-            None
-        };
+    pub fn new(file_names: Vec<String>) -> Result<Config, Box<dyn Error>> {
         for f in &file_names {
             if !Path::new(f).exists() {
                 return Err(format!("file {} doesn't exist", f).into());
             }
         }
 
-        Ok(Config {
-            file_names,
-            ipinfo_token,
-            ipinfo_use_cache: true, // TODO: make configurable
-        })
-    }
-
-    fn url_of(&self, address: &Subnet) -> String {
-        format!(
-            "https://ipinfo.io/{}?token={}",
-            address.to_string(),
-            self.ipinfo_token
-                .as_ref()
-                .expect("no token available to construct URL")
-        )
+        Ok(Config { file_names })
     }
 
     pub fn has_files(&self) -> bool {
@@ -101,20 +69,6 @@ pub fn find_subnets(
         println!("\t{}", ips.join("\n\t"));
     }
     Ok(subnets)
-}
-
-/// WIP
-pub fn recheck_subnets(config: Config, subnets: HashMap<String, Vec<Subnet>>) {
-    let client = reqwest::Client::new();
-    for (subnet, addrs) in subnets.iter() {
-        let data = client.get(config.url_of(addrs.first().unwrap()));
-    }
-    // make cache in ~/.ipinfo/
-    // exclude private subnets
-    // for each IP in the subnet
-    // - check its actual subnet using API
-    // - ...
-    todo!()
 }
 
 /// IPv4 subnet representation
