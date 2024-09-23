@@ -5,4 +5,3 @@ edition = "2021"
 
 [dependencies]
 argparse = "0.2.2"
-reqwest = "0.12.7"

@@ -1,7 +1,7 @@
 use std::error::Error;
 
-use argparse::{ArgumentParser, List, StoreTrue};
-use ipv4_classify::{Config, IPINFO_TOKEN_FILE};
+use argparse::{ArgumentParser, List};
+use ipv4_classify::Config;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let mut file_names = vec![];
