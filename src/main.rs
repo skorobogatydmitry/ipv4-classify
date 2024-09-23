@@ -25,7 +25,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         arg_parser.parse_args_or_exit();
     }
     let config = Config::new(file_names, query_ipinfo)?;
-    ipv4_classify::find_subnets(config.file_names)?;
-
-    Ok(())
+    if config.has_files() {
+        let subnets = ipv4_classify::find_subnets(config.file_names)?;
+        // ipv4_classify::recheck_subnets(config, subnets);
+        Ok(())
+    } else {
+        Err("no files provided, try -h".into())
+    }
 }

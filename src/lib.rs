@@ -6,27 +6,28 @@ use std::{
     fmt::{Debug, Display, Formatter},
     fs,
     mem::replace,
-    net::{AddrParseError, Ipv4Addr},
+    num::ParseIntError,
     path::Path,
-    str::FromStr,
 };
 
 #[cfg(test)]
 mod test;
 
+/// relative path to auth token in the current user's home dir
 pub const IPINFO_TOKEN_FILE: &str = ".ipinfo/token";
 
-/// tool's options
+/// parsed tool's config
 pub struct Config {
     pub file_names: Vec<String>,
     ipinfo_token: Option<String>,
+    ipinfo_use_cache: bool,
 }
 
 impl Config {
     pub fn new(file_names: Vec<String>, query_ipinfo: bool) -> Result<Config, Box<dyn Error>> {
         let ipinfo_token = if query_ipinfo {
             let full_path = home_dir()
-                .ok_or("Unable to get user home directory")?
+                .ok_or("unable to get user home directory")?
                 .join(IPINFO_TOKEN_FILE);
             eprintln!(
                 "reading ipinfo.io token from {}",
@@ -45,10 +46,28 @@ impl Config {
         Ok(Config {
             file_names,
             ipinfo_token,
+            ipinfo_use_cache: true, // TODO: make configurable
         })
+    }
+
+    fn url_of(&self, address: &Subnet) -> String {
+        format!(
+            "https://ipinfo.io/{}?token={}",
+            address.to_string(),
+            self.ipinfo_token
+                .as_ref()
+                .expect("no token available to construct URL")
+        )
+    }
+
+    pub fn has_files(&self) -> bool {
+        !self.file_names.is_empty()
     }
 }
 
+/// # parse a \n-separated list of IP addresses from the provided files into subnets
+/// # returns
+/// Err - if one of the files cannot be read, some line isn't a correct IP address or smth else went terribly wrong
 pub fn find_subnets(
     file_names: Vec<String>,
 ) -> Result<HashMap<String, Vec<String>>, Box<dyn Error>> {
@@ -60,8 +79,8 @@ pub fn find_subnets(
             .split("\n")
             .map(|el| el.trim())
             .filter(|el| !el.is_empty())
-            .map(|str_addr| Ipv4Addr::from_str(str_addr))
-            .collect::<Result<Vec<Ipv4Addr>, AddrParseError>>()?;
+            .map(|str_addr| Subnet::from_str(str_addr))
+            .collect::<Result<Vec<Subnet>, Box<dyn Error>>>()?;
 
         eprintln!("there are {} addresses in {}", addrs.len(), file_name);
         while let Some(addr) = addrs.pop() {
@@ -84,74 +103,117 @@ pub fn find_subnets(
     Ok(subnets)
 }
 
-fn recheck_subnets(_subnets: HashMap<Prefix, Vec<Ipv4Addr>>) {
+/// WIP
+pub fn recheck_subnets(config: Config, subnets: HashMap<String, Vec<Subnet>>) {
+    let client = reqwest::Client::new();
+    for (subnet, addrs) in subnets.iter() {
+        let data = client.get(config.url_of(addrs.first().unwrap()));
+    }
+    // make cache in ~/.ipinfo/
+    // exclude private subnets
     // for each IP in the subnet
     // - check its actual subnet using API
     // - ...
     todo!()
 }
 
+/// IPv4 subnet representation
+/// consists of u32 and netmask
 #[derive(Debug, PartialEq)]
-struct Prefix {
-    bean: u32,    // IP address with significant bits representing the subnet
-    mask_len: u8, // number of significant bits in the bean
+struct Subnet {
+    bits: u32,    // IP address with significant bits representing the subnet
+    mask_len: u8, // number of significant bits in the bits
     mask: u32,    // prebuilt number with leading significant bits set
 }
 
-impl Prefix {
+impl Subnet {
     /// root of all ipv4 addresses
     pub fn root() -> Self {
-        Prefix {
-            bean: 0,
+        Self {
+            bits: 0,
             mask_len: 0,
             mask: 0,
         }
     }
 
-    /// checks whether the prefix includes the address
-    pub fn contains(&self, addr: &Ipv4Addr) -> bool {
-        let addr_number = u32::from_be_bytes(addr.octets());
-        return addr_number & self.mask == self.bean;
-    }
-
-    #[cfg(test)]
-    pub fn set_mask(&mut self, new_mask_len: u8) {
-        self.mask_len = new_mask_len;
-        self.mask = u32::MAX << (32 - new_mask_len);
-    }
-
-    // make prefix from the address
-    pub fn from_addr(addr: &Ipv4Addr) -> Self {
-        Self {
-            bean: u32::from_be_bytes(addr.octets()),
-            mask_len: 32,
-            mask: u32::MAX,
+    /// make subnet from octets & mask length
+    /// clear any bits set below the mask: e.g. 1.2.3.4/24 is acceptable but gets transformed to 1.2.3.0/24
+    pub fn new(o1: u8, o2: u8, o3: u8, o4: u8, mask_len: u8) -> Result<Self, Box<dyn Error>> {
+        if mask_len > 32 {
+            Err("mask len is > 32".into())
+        } else {
+            let mask = u32::MAX << (32 - mask_len);
+            Ok(Self {
+                bits: u32::from_be_bytes([o1, o2, o3, o4]) & mask,
+                mask_len: mask_len,
+                mask,
+            })
         }
     }
 
-    /// find and return the closest common of the two prefixes if exists
+    /// parse string with netmask into a subnet
+    pub fn from_str(src: &str) -> Result<Self, Box<dyn Error>> {
+        let (addr, mask_len) = if src.contains("/") {
+            let split: Vec<&str> = src.split('/').collect();
+            if split.len() != 2 {
+                return Err("there are more than 1 / in the address".into());
+            }
+            if let Ok(mask_len) = split.get(1).unwrap().parse::<u8>() {
+                (*split.get(0).unwrap(), mask_len)
+            } else {
+                return Err(format!("can't parse netmask from {}", src).into());
+            }
+        } else {
+            (src, 32)
+        };
+        match addr
+            .split('.')
+            .map(|el| el.parse::<u8>())
+            .collect::<Result<Vec<u8>, ParseIntError>>()
+        {
+            Ok(octets) => {
+                if octets.len() != 4 {
+                    Err(format!("address {} doesn't have 4 dot-separated octets", addr).into())
+                } else {
+                    Self::new(octets[0], octets[1], octets[2], octets[3], mask_len)
+                }
+            }
+            Err(e) => Err(format!("unable to parse {:?}: {:?}", addr, e).into()),
+        }
+    }
+
+    /// check whether subnet includes other subnet
+    pub fn contains(&self, other: &Subnet) -> bool {
+        if self.mask_len > other.mask_len {
+            return false;
+        }
+        // let addr_number = u32::from_be_bytes(addr.octets());
+        return other.bits & self.mask == self.bits;
+    }
+
+    /// find and return the closest common of the two subnets if exists
     /// min_mask defines minimal (shortest) mask to look for
     /// e.g. 10.0.0.0/24 and 10.128.0.0/24 are both of 10.0.0.0/8
     /// if min_mask is 16 returns None for the above ranges,
     /// as 8 is less than min_mask - it's the only case when None can be returned,
     /// as default values for min_mask is 0, so 0.0.0.0/0 is the worst case
     /// # Panics
-    /// if min_mask is bigger than any of the prefix masks
-    pub fn common_of(p1: &Prefix, p2: &Prefix, min_mask: Option<u8>) -> Option<Prefix> {
+    /// if min_mask is bigger than any of the subnet masks
+    pub fn common_of(s1: &Subnet, s2: &Subnet, min_mask: Option<u8>) -> Option<Subnet> {
         let min_mask = match min_mask {
             Some(min_mask) => min_mask,
             None => 0,
         };
-        // get the shortest prefix to start from
-        let mut curr_mask_len = cmp::min(p1.mask_len, p2.mask_len);
+        // get the shortest mask to start from
+        let mut curr_mask_len = cmp::min(s1.mask_len, s2.mask_len);
         if min_mask > curr_mask_len {
             panic!("min_mask {} is bigger than {}", min_mask, curr_mask_len);
         }
         let mut curr_mask = u32::MAX << (32 - curr_mask_len);
         while curr_mask_len >= min_mask {
-            if p1.bean & curr_mask == p2.bean & curr_mask {
-                return Some(Prefix {
-                    bean: p1.bean & curr_mask,
+            if s1.bits & curr_mask == s2.bits & curr_mask {
+                return Some(Subnet {
+                    bits: s1.bits & curr_mask,
                     mask_len: curr_mask_len,
                     mask: curr_mask,
                 });
@@ -163,14 +225,14 @@ impl Prefix {
     }
 }
 
-impl Display for Prefix {
+impl Display for Subnet {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
         f.write_str(&format!(
             "{}.{}.{}.{}/{}",
-            (self.bean & (0xFF << 24)) >> 24,
-            (self.bean & (0xFF << 16)) >> 16,
-            (self.bean & (0xFF << 8)) >> 8,
-            self.bean & 0xFF,
+            (self.bits & (0xFF << 24)) >> 24,
+            (self.bits & (0xFF << 16)) >> 16,
+            (self.bits & (0xFF << 8)) >> 8,
+            self.bits & 0xFF,
             self.mask_len
         ))
     }
@@ -178,89 +240,87 @@ impl Display for Prefix {
 
 #[derive(Debug)]
 struct AddressTree {
-    prefix: Prefix,
+    subnet: Subnet,
     children: Option<Vec<AddressTree>>,
 }
 
 impl AddressTree {
     /// make a new empty tree starting from 0.0.0.0/0
     pub fn new() -> Self {
-        AddressTree {
-            prefix: Prefix::root(),
+        Self {
+            subnet: Subnet::root(),
             children: None,
         }
     }
 
-    // make a new empty tree starting at addr
-    fn of(addr: &Ipv4Addr) -> Self {
-        AddressTree {
-            prefix: Prefix::from_addr(addr),
+    /// make a new empty tree starting at subnet
+    fn of(subnet: Subnet) -> Self {
+        Self {
+            subnet,
             children: None,
         }
     }
 
-    /// try to place the supplied address in the tree
+    /// try to place the supplied subnet in the tree
     /// # Returns
-    /// Ok(()) - if address was adopted by the tree
-    /// Err(new_addr) - if it doesn't belond to the subtree
-    pub fn push(&mut self, new_addr: Ipv4Addr) -> Result<(), Ipv4Addr> {
-        eprintln!("attempt to push {} to {}", new_addr, self.prefix);
-        if self.prefix.contains(&new_addr) {
+    /// Ok(()) - address was adopted by the tree
+    /// Err(new_subnet) - supplied subnet doesn't belond to the current tree
+    pub fn push(&mut self, new_subnet: Subnet) -> Result<(), Subnet> {
+        eprintln!("attempt to push {} to {}", new_subnet, self.subnet);
+        if self.subnet.contains(&new_subnet) {
             if let Some(ref mut children) = self.children {
-                let mut is_consumed = false;
+                let mut to_consume = Some(new_subnet);
                 for ch in children.iter_mut() {
-                    eprintln!("processing prefix {}", ch.prefix);
-                    is_consumed = match ch.push(new_addr) {
-                        Ok(_) => true, // address found its place, nothing to do here
-                        Err(new_addr) => {
-                            // it wasn't consumed - try to adopt
-                            match Prefix::common_of(
-                                &ch.prefix,
-                                &Prefix::from_addr(&new_addr),
-                                Some(self.prefix.mask_len + 1),
-                            ) {
-                                Some(new_prefix) => {
-                                    eprintln!(
-                                        "address {} and {} are joined into {}",
-                                        new_addr, ch.prefix, new_prefix
-                                    );
-                                    ch.stepdown(new_prefix, AddressTree::of(&new_addr));
-                                    true // found something in common
+                    eprintln!("processing subnet {}", ch.subnet);
+                    // check whether there's an address to take
+                    if let Some(new_subnet) = to_consume.take() {
+                        match ch.push(new_subnet) {
+                            Ok(_) => return Ok(()), // address found its place, nothing to do here
+                            Err(new_subnet) => {
+                                // it wasn't consumed - try to adopt
+                                match Subnet::common_of(
+                                    &ch.subnet,
+                                    &new_subnet,
+                                    Some(self.subnet.mask_len + 1),
+                                ) {
+                                    Some(new_intermediate) => {
+                                        eprintln!(
+                                            "address {} and {} are joined into {}",
+                                            new_subnet, ch.subnet, new_intermediate
+                                        );
+                                        ch.stepdown(new_intermediate, AddressTree::of(new_subnet));
+                                    }
+                                    None => to_consume = Some(new_subnet),
                                 }
-                                None => false, // the addr doesn't have anything in common with the child
                             }
                         }
-                    };
-                    if is_consumed {
-                        break;
+                    } else {
+                        // address was placed
+                        return Ok(());
                     }
                 }
-                if !is_consumed {
-                    eprintln!("address {} settled in {}", new_addr, self.prefix);
-                    children.push(AddressTree::of(&new_addr));
+                if let Some(new_subnet) = to_consume.take() {
+                    eprintln!("address {} settled in {}", new_subnet, self.subnet);
+                    children.push(AddressTree::of(new_subnet));
                 }
-                return Ok(());
             } else {
-                self.children = Some(vec![AddressTree {
-                    prefix: Prefix::from_addr(&new_addr),
-                    children: None,
-                }]);
-                Ok(())
+                self.children = Some(vec![AddressTree::of(new_subnet)]);
             }
+            Ok(())
         } else {
-            Err(new_addr)
+            Err(new_subnet)
         }
     }
 
-    pub fn stepdown(&mut self, new_prefix: Prefix, neighbour: AddressTree) {
-        let my_prefix = replace(&mut self.prefix, new_prefix);
+    fn stepdown(&mut self, new_subnet: Subnet, neighbour: AddressTree) {
+        let my_subnet = replace(&mut self.subnet, new_subnet);
         let new_me = match self.children.take() {
             Some(children) => AddressTree {
-                prefix: my_prefix,
+                subnet: my_subnet,
                 children: Some(children),
             },
             None => AddressTree {
-                prefix: my_prefix,
+                subnet: my_subnet,
                 children: None,
             },
         };
@@ -268,11 +328,11 @@ impl AddressTree {
         self.children = Some(vec![new_me, neighbour]);
     }
 
-    // return vector of "subnets" - prefixes that contain at least one tree leaf
+    /// extract vector of "subnets" - subnets that contain at least one tree leaf (IP address)
     fn get_subnets(&self) -> Vec<&AddressTree> {
         let mut res = vec![];
         if let Some(ref children) = self.children {
-            if children.iter().any(|ch| ch.prefix.mask_len == 32) {
+            if children.iter().any(|ch| ch.subnet.mask_len == 32) {
                 // chop the subtree at the first IP address in it
                 res.push(self);
             } else {
@@ -305,10 +365,10 @@ impl AddressTree {
 
         for s in subnets {
             res.insert(
-                s.prefix.to_string(),
+                s.subnet.to_string(),
                 s.get_leafs()
                     .iter()
-                    .map(|leaf| leaf.prefix.to_string())
+                    .map(|leaf| leaf.subnet.to_string())
                     .collect(),
             );
         }
@@ -318,7 +378,7 @@ impl AddressTree {
 
 impl Display for AddressTree {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), std::fmt::Error> {
-        f.write_str(&format!("{}", self.prefix))?;
+        f.write_str(&format!("{}", self.subnet))?;
         if let Some(ref children) = self.children {
             f.write_str("=>[")?;
             for ref ch in children {
